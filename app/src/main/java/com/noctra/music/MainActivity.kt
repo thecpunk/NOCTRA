@@ -55,12 +55,10 @@ data class Track(
 )
 
 class MainActivity : ComponentActivity() {
-
     private lateinit var player: ExoPlayer
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         player = ExoPlayer.Builder(this).build()
 
         setContent {
@@ -68,10 +66,17 @@ class MainActivity : ComponentActivity() {
                 player = player,
                 loadCatalog = { query ->
                     lifecycleScope.launch {
-                        catalogState.value = loadArchiveCatalog(query)
+                        catalogState.value = emptyList()
+                        loadingState.value = true
+                        try {
+                            catalogState.value = loadArchiveCatalog(query)
+                        } finally {
+                            loadingState.value = false
+                        }
                     }
                 },
-                catalog = catalogState
+                catalog = catalogState,
+                loading = loadingState
             )
         }
     }
@@ -83,12 +88,12 @@ class MainActivity : ComponentActivity() {
 
     companion object {
         val catalogState = mutableStateOf<List<Track>>(emptyList())
+        val loadingState = mutableStateOf(false)
     }
 }
 
 private suspend fun loadArchiveCatalog(query: String): List<Track> =
     withContext(Dispatchers.IO) {
-
         try {
             val safeQuery = query.trim()
                 .replace("\\", " ")
@@ -103,7 +108,7 @@ private suspend fun loadArchiveCatalog(query: String): List<Track> =
             val url =
                 "https://archive.org/advancedsearch.php?q=${URLEncoder.encode(q, "UTF-8")}" +
                 "&fl[]=identifier&fl[]=title&fl[]=creator&fl[]=licenseurl" +
-                "&sort[]=downloads%20desc&rows=24&page=1&output=json"
+                "&sort[]=downloads%20desc&rows=16&page=1&output=json"
 
             val conn = URL(url).openConnection() as HttpURLConnection
             conn.connectTimeout = 8000
@@ -112,11 +117,9 @@ private suspend fun loadArchiveCatalog(query: String): List<Track> =
             val root = JSONObject(
                 conn.inputStream.bufferedReader().use { it.readText() }
             )
-
             conn.disconnect()
 
             val docs = root.getJSONObject("response").getJSONArray("docs")
-
             val candidates = mutableListOf<JSONObject>()
 
             for (i in 0 until docs.length()) {
@@ -130,17 +133,13 @@ private suspend fun loadArchiveCatalog(query: String): List<Track> =
                     lic.contains("creativecommons.org/publicdomain/zero/", true) ||
                     lic.contains("creativecommons.org/publicdomain/mark/", true)
 
-                if (id.isNotBlank() && allowed) {
-                    candidates.add(d)
-                }
-
-                if (candidates.size >= 12) break
+                if (id.isNotBlank() && allowed) candidates.add(d)
+                if (candidates.size >= 8) break
             }
 
             candidates.mapNotNull { d ->
                 try {
                     val id = d.optString("identifier")
-
                     val metaConn =
                         URL("https://archive.org/metadata/$id")
                             .openConnection() as HttpURLConnection
@@ -151,11 +150,9 @@ private suspend fun loadArchiveCatalog(query: String): List<Track> =
                     val meta = JSONObject(
                         metaConn.inputStream.bufferedReader().use { it.readText() }
                     )
-
                     metaConn.disconnect()
 
                     val files = meta.optJSONArray("files") ?: return@mapNotNull null
-
                     var fileName: String? = null
 
                     for (j in 0 until files.length()) {
@@ -163,11 +160,9 @@ private suspend fun loadArchiveCatalog(query: String): List<Track> =
                         val name = f.optString("name")
                         val format = f.optString("format")
 
-                        if (
-                            (format.contains("MP3", true) ||
-                             name.endsWith(".mp3", true)) &&
-                            !name.contains("_spectrogram")
-                        ) {
+                        if ((format.contains("MP3", true) ||
+                            name.endsWith(".mp3", true)) &&
+                            !name.contains("_spectrogram")) {
                             fileName = name
                             break
                         }
@@ -186,12 +181,10 @@ private suspend fun loadArchiveCatalog(query: String): List<Track> =
                         license = d.optString("licenseurl"),
                         stream = "https://archive.org/download/$id/$encoded"
                     )
-
                 } catch (_: Exception) {
                     null
                 }
             }
-
         } catch (_: Exception) {
             emptyList()
         }
@@ -201,7 +194,8 @@ private suspend fun loadArchiveCatalog(query: String): List<Track> =
 fun NoctraApp(
     player: ExoPlayer,
     loadCatalog: (String) -> Unit,
-    catalog: State<List<Track>>
+    catalog: State<List<Track>>,
+    loading: State<Boolean>
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
 
@@ -226,10 +220,7 @@ fun NoctraApp(
         } else {
             favorites.add(track.id)
         }
-
-        prefs.edit()
-            .putStringSet("favorites", favorites.toSet())
-            .apply()
+        prefs.edit().putStringSet("favorites", favorites.toSet()).apply()
     }
 
     val waveTracks = remember(catalog.value, favorites.toList()) {
@@ -240,13 +231,13 @@ fun NoctraApp(
 
         val recommended = catalog.value.filter {
             !favorites.contains(it.id) &&
-            likedArtists.any { artist ->
-                artist.equals(it.artist, ignoreCase = true)
-            }
+                likedArtists.any { artist ->
+                    artist.equals(it.artist, ignoreCase = true)
+                }
         }
 
-        if (recommended.isNotEmpty()) recommended else
-            catalog.value.filter { !favorites.contains(it.id) }
+        if (recommended.isNotEmpty()) recommended
+        else catalog.value.filter { !favorites.contains(it.id) }
     }
 
     LaunchedEffect(Unit) {
@@ -259,12 +250,8 @@ fun NoctraApp(
                 playing = isPlaying
             }
         }
-
         player.addListener(listener)
-
-        onDispose {
-            player.removeListener(listener)
-        }
+        onDispose { player.removeListener(listener) }
     }
 
     MaterialTheme(
@@ -279,31 +266,25 @@ fun NoctraApp(
         Scaffold(
             containerColor = Bg,
             bottomBar = {
-                NavigationBar(
-                    containerColor = Panel,
-                    contentColor = White
-                ) {
+                NavigationBar(containerColor = Panel, contentColor = White) {
                     NavigationBarItem(
                         selected = tab == 0,
                         onClick = { tab = 0 },
                         icon = { Icon(Icons.Default.Home, null) },
                         label = { Text("Главная") }
                     )
-
                     NavigationBarItem(
                         selected = tab == 1,
                         onClick = { tab = 1 },
                         icon = { Icon(Icons.Default.LibraryMusic, null) },
                         label = { Text("Моя волна") }
                     )
-
                     NavigationBarItem(
                         selected = tab == 2,
                         onClick = { tab = 2 },
                         icon = { Icon(Icons.Default.Search, null) },
                         label = { Text("Поиск") }
                     )
-
                     NavigationBarItem(
                         selected = tab == 3,
                         onClick = { tab = 3 },
@@ -313,14 +294,12 @@ fun NoctraApp(
                 }
             }
         ) { padding ->
-
             Column(
                 Modifier
                     .fillMaxSize()
                     .padding(padding)
                     .padding(horizontal = 18.dp)
             ) {
-
                 Row(
                     Modifier
                         .fillMaxWidth()
@@ -335,7 +314,6 @@ fun NoctraApp(
                             fontWeight = FontWeight.Black,
                             letterSpacing = 4.sp
                         )
-
                         Text(
                             "YOUR MUSIC. YOUR NIGHT.",
                             color = Muted,
@@ -343,7 +321,6 @@ fun NoctraApp(
                             letterSpacing = 2.sp
                         )
                     }
-
                     Box(
                         Modifier
                             .size(42.dp)
@@ -360,7 +337,6 @@ fun NoctraApp(
                 }
 
                 when (tab) {
-
                     0 -> {
                         Text(
                             "ТВОЙ МУЗЫКАЛЬНЫЙ МИР",
@@ -368,9 +344,7 @@ fun NoctraApp(
                             fontSize = 10.sp,
                             letterSpacing = 2.sp
                         )
-
                         Spacer(Modifier.height(10.dp))
-
                         Text(
                             "Слушай то, что\nтебе нравится.",
                             color = White,
@@ -378,7 +352,6 @@ fun NoctraApp(
                             fontWeight = FontWeight.Bold,
                             lineHeight = 36.sp
                         )
-
                         Spacer(Modifier.height(20.dp))
 
                         Box(
@@ -405,16 +378,13 @@ fun NoctraApp(
                                     fontSize = 10.sp,
                                     letterSpacing = 2.sp
                                 )
-
                                 Spacer(Modifier.height(8.dp))
-
                                 Text(
                                     "ТВОЯ ВОЛНА",
                                     color = White,
                                     fontSize = 24.sp,
                                     fontWeight = FontWeight.Bold
                                 )
-
                                 Text(
                                     "Музыка, подобранная для тебя",
                                     color = Muted,
@@ -424,63 +394,42 @@ fun NoctraApp(
                         }
 
                         Spacer(Modifier.height(22.dp))
-
                         Text(
                             "ИСПОЛНИТЕЛИ",
                             color = White,
                             fontSize = 18.sp,
                             fontWeight = FontWeight.Bold
                         )
-
                         Spacer(Modifier.height(12.dp))
 
-                        LazyRow(
-                            horizontalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            items(
-                                catalog.value.map { it.artist }
-                                    .distinct()
-                                    .take(10)
-                            ) { artist ->
-                                Box(
-                                    Modifier
-                                        .clip(RoundedCornerShape(14.dp))
-                                        .background(Panel)
-                                        .clickable {
-                                            query = artist
-                                            loadCatalog(artist)
-                                            tab = 2
-                                        }
-                                        .padding(14.dp)
-                                ) {
-                                    Text(
-                                        artist,
-                                        color = White,
-                                        maxLines = 1,
-                                        fontSize = 12.sp
-                                    )
-                                }
+                        ArtistRow(
+                            artists = catalog.value.map { it.artist }
+                                .filter { it.isNotBlank() }
+                                .distinct()
+                                .take(10),
+                            onArtistClick = {
+                                query = it
+                                loadCatalog(it)
+                                tab = 2
                             }
-                        }
+                        )
 
                         Spacer(Modifier.height(20.dp))
-
                         Text(
                             "ПОПУЛЯРНЫЕ ТРЕКИ",
                             color = White,
                             fontSize = 18.sp,
                             fontWeight = FontWeight.Bold
                         )
-
+                        if (loading.value) LoadingLine()
                         TrackList(
-                            catalog.value,
+                            catalog.value.take(8),
                             favorites,
-                            onFavorite = ::toggleFavorite,
-                            onPlay = {
-                                current = it
-                                playTrack(player, it)
-                            }
-                        )
+                            ::toggleFavorite
+                        ) {
+                            current = it
+                            playTrack(player, it)
+                        }
                     }
 
                     1 -> {
@@ -490,43 +439,68 @@ fun NoctraApp(
                             fontSize = 11.sp,
                             letterSpacing = 2.sp
                         )
-
                         Spacer(Modifier.height(10.dp))
-
                         Text(
                             "Для тебя.",
                             color = White,
                             fontSize = 32.sp,
                             fontWeight = FontWeight.Bold
                         )
-
                         Spacer(Modifier.height(8.dp))
-
                         Text(
-                            "Рекомендации на основе твоих любимых треков.",
+                            "Подборка музыки и исполнителей.",
                             color = Muted,
                             fontSize = 12.sp
                         )
+                        Spacer(Modifier.height(20.dp))
+
+                        Text(
+                            "ИСПОЛНИТЕЛИ ДЛЯ ТЕБЯ",
+                            color = White,
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(Modifier.height(10.dp))
+
+                        ArtistRow(
+                            artists = catalog.value.map { it.artist }
+                                .filter { it.isNotBlank() }
+                                .distinct()
+                                .take(12),
+                            onArtistClick = {
+                                query = it
+                                loadCatalog(it)
+                                tab = 2
+                            }
+                        )
 
                         Spacer(Modifier.height(20.dp))
+                        Text(
+                            if (favorites.isEmpty()) "ПОПУЛЯРНОЕ СЕЙЧАС"
+                            else "НА ОСНОВЕ ТВОИХ ЛАЙКОВ",
+                            color = White,
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Spacer(Modifier.height(8.dp))
 
                         if (favorites.isEmpty()) {
                             Text(
-                                "Ставь лайки понравившимся трекам. Так NOCTRA сможет подобрать похожую музыку.",
+                                "Лайкай треки, чтобы формировать свою музыкальную волну.",
                                 color = Muted,
                                 fontSize = 13.sp
                             )
                         }
 
+                        if (loading.value) LoadingLine()
                         TrackList(
-                            waveTracks,
+                            waveTracks.take(10),
                             favorites,
-                            onFavorite = ::toggleFavorite,
-                            onPlay = {
-                                current = it
-                                playTrack(player, it)
-                            }
-                        )
+                            ::toggleFavorite
+                        ) {
+                            current = it
+                            playTrack(player, it)
+                        }
                     }
 
                     2 -> {
@@ -536,25 +510,19 @@ fun NoctraApp(
                             fontSize = 11.sp,
                             letterSpacing = 2.sp
                         )
-
                         Spacer(Modifier.height(12.dp))
 
                         OutlinedTextField(
                             value = query,
                             onValueChange = { query = it },
                             modifier = Modifier.fillMaxWidth(),
-                            placeholder = {
-                                Text("Трек или исполнитель")
-                            },
-                            leadingIcon = {
-                                Icon(Icons.Default.Search, null)
-                            },
+                            placeholder = { Text("Трек или исполнитель") },
+                            leadingIcon = { Icon(Icons.Default.Search, null) },
                             singleLine = true,
                             shape = RoundedCornerShape(16.dp)
                         )
 
                         Spacer(Modifier.height(10.dp))
-
                         Button(
                             onClick = { loadCatalog(query) },
                             colors = ButtonDefaults.buttonColors(
@@ -565,16 +533,15 @@ fun NoctraApp(
                         }
 
                         Spacer(Modifier.height(16.dp))
-
+                        if (loading.value) LoadingLine()
                         TrackList(
-                            catalog.value,
+                            catalog.value.take(12),
                             favorites,
-                            onFavorite = ::toggleFavorite,
-                            onPlay = {
-                                current = it
-                                playTrack(player, it)
-                            }
-                        )
+                            ::toggleFavorite
+                        ) {
+                            current = it
+                            playTrack(player, it)
+                        }
                     }
 
                     3 -> {
@@ -584,16 +551,13 @@ fun NoctraApp(
                             fontSize = 11.sp,
                             letterSpacing = 2.sp
                         )
-
                         Spacer(Modifier.height(12.dp))
-
                         Text(
                             "Избранное",
                             color = White,
                             fontSize = 27.sp,
                             fontWeight = FontWeight.Bold
                         )
-
                         Spacer(Modifier.height(14.dp))
 
                         val liked = catalog.value.filter {
@@ -609,18 +573,16 @@ fun NoctraApp(
                             TrackList(
                                 liked,
                                 favorites,
-                                onFavorite = ::toggleFavorite,
-                                onPlay = {
-                                    current = it
-                                    playTrack(player, it)
-                                }
-                            )
+                                ::toggleFavorite
+                            ) {
+                                current = it
+                                playTrack(player, it)
+                            }
                         }
                     }
                 }
 
                 Spacer(Modifier.height(12.dp))
-
                 current?.let { track ->
                     Row(
                         Modifier
@@ -638,14 +600,12 @@ fun NoctraApp(
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
-
                             Text(
                                 track.artist,
                                 color = Muted,
                                 fontSize = 11.sp
                             )
                         }
-
                         IconButton(
                             onClick = {
                                 if (player.isPlaying) player.pause()
@@ -661,8 +621,65 @@ fun NoctraApp(
                         }
                     }
                 }
-
                 Spacer(Modifier.height(8.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun LoadingLine() {
+    LinearProgressIndicator(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 10.dp),
+        color = Accent,
+        trackColor = Panel
+    )
+}
+
+@Composable
+private fun ArtistRow(
+    artists: List<String>,
+    onArtistClick: (String) -> Unit
+) {
+    LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        items(artists) { artist ->
+            Column(
+                modifier = Modifier
+                    .width(112.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(Panel)
+                    .clickable { onArtistClick(artist) }
+                    .padding(12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Box(
+                    Modifier
+                        .size(66.dp)
+                        .clip(CircleShape)
+                        .background(
+                            Brush.linearGradient(
+                                listOf(Color(0xFF666666), Color(0xFF222222))
+                            )
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        artist.take(1).uppercase(),
+                        color = White,
+                        fontSize = 25.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    artist,
+                    color = White,
+                    fontSize = 11.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
         }
     }
@@ -700,7 +717,6 @@ private fun TrackList(
             verticalArrangement = Arrangement.spacedBy(5.dp)
         ) {
             items(tracks, key = { it.id }) { track ->
-
                 Row(
                     Modifier
                         .fillMaxWidth()
@@ -736,7 +752,6 @@ private fun TrackList(
                             overflow = TextOverflow.Ellipsis,
                             fontSize = 14.sp
                         )
-
                         Text(
                             track.artist,
                             color = Muted,
@@ -745,9 +760,7 @@ private fun TrackList(
                         )
                     }
 
-                    IconButton(
-                        onClick = { onFavorite(track) }
-                    ) {
+                    IconButton(onClick = { onFavorite(track) }) {
                         Icon(
                             if (favorites.contains(track.id))
                                 Icons.Default.Favorite
