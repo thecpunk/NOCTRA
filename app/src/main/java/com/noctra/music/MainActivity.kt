@@ -95,24 +95,24 @@ class MainActivity : ComponentActivity() {
 private suspend fun loadArchiveCatalog(query: String): List<Track> =
     withContext(Dispatchers.IO) {
         try {
-            val safeQuery = query.trim()
+            val artist = query.trim()
                 .replace("\\", " ")
                 .replace("\"", " ")
+                .replace(":", " ")
+                .take(120)
 
-            val q = if (safeQuery.isBlank()) {
-                "mediatype:audio AND licenseurl:*"
-            } else {
-                "mediatype:audio AND licenseurl:* AND (title:\"$safeQuery\" OR creator:\"$safeQuery\")"
-            }
+            if (artist.isBlank()) return@withContext emptyList()
 
-            val url =
+            val q = "mediatype:audio AND licenseurl:* AND creator:\"$artist\""
+
+            val searchUrl =
                 "https://archive.org/advancedsearch.php?q=${URLEncoder.encode(q, "UTF-8")}" +
                 "&fl[]=identifier&fl[]=title&fl[]=creator&fl[]=licenseurl" +
-                "&sort[]=downloads%20desc&rows=16&page=1&output=json"
+                "&sort[]=date%20asc&rows=500&page=1&output=json"
 
-            val conn = URL(url).openConnection() as HttpURLConnection
-            conn.connectTimeout = 8000
-            conn.readTimeout = 10000
+            val conn = URL(searchUrl).openConnection() as HttpURLConnection
+            conn.connectTimeout = 10000
+            conn.readTimeout = 15000
 
             val root = JSONObject(
                 conn.inputStream.bufferedReader().use { it.readText() }
@@ -133,63 +133,77 @@ private suspend fun loadArchiveCatalog(query: String): List<Track> =
                     lic.contains("creativecommons.org/publicdomain/zero/", true) ||
                     lic.contains("creativecommons.org/publicdomain/mark/", true)
 
-                if (id.isNotBlank() && allowed) candidates.add(d)
-                if (candidates.size >= 8) break
-            }
-
-            candidates.mapNotNull { d ->
-                try {
-                    val id = d.optString("identifier")
-                    val metaConn =
-                        URL("https://archive.org/metadata/$id")
-                            .openConnection() as HttpURLConnection
-
-                    metaConn.connectTimeout = 5000
-                    metaConn.readTimeout = 7000
-
-                    val meta = JSONObject(
-                        metaConn.inputStream.bufferedReader().use { it.readText() }
-                    )
-                    metaConn.disconnect()
-
-                    val files = meta.optJSONArray("files") ?: return@mapNotNull null
-                    var fileName: String? = null
-
-                    for (j in 0 until files.length()) {
-                        val f = files.optJSONObject(j) ?: continue
-                        val name = f.optString("name")
-                        val format = f.optString("format")
-
-                        if ((format.contains("MP3", true) ||
-                            name.endsWith(".mp3", true)) &&
-                            !name.contains("_spectrogram")) {
-                            fileName = name
-                            break
-                        }
-                    }
-
-                    if (fileName == null) return@mapNotNull null
-
-                    val encoded = fileName.split("/").joinToString("/") {
-                        URLEncoder.encode(it, "UTF-8").replace("+", "%20")
-                    }
-
-                    Track(
-                        id = id,
-                        title = d.optString("title", "Без названия"),
-                        artist = d.optString("creator", "Неизвестный исполнитель"),
-                        license = d.optString("licenseurl"),
-                        stream = "https://archive.org/download/$id/$encoded"
-                    )
-                } catch (_: Exception) {
-                    null
+                if (id.isNotBlank() && allowed) {
+                    candidates.add(d)
                 }
             }
+
+            val semaphore = kotlinx.coroutines.sync.Semaphore(6)
+
+            candidates.take(120).map { d ->
+                async {
+                    semaphore.acquire()
+                    try {
+                        val id = d.optString("identifier")
+
+                        val metaConn =
+                            URL("https://archive.org/metadata/$id")
+                                .openConnection() as HttpURLConnection
+
+                        metaConn.connectTimeout = 8000
+                        metaConn.readTimeout = 10000
+
+                        val meta = JSONObject(
+                            metaConn.inputStream.bufferedReader().use { it.readText() }
+                        )
+                        metaConn.disconnect()
+
+                        val files = meta.optJSONArray("files")
+                            ?: return@async null
+
+                        var fileName: String? = null
+
+                        for (j in 0 until files.length()) {
+                            val f = files.optJSONObject(j) ?: continue
+                            val name = f.optString("name")
+                            val format = f.optString("format")
+
+                            if ((format.contains("MP3", true) ||
+                                name.endsWith(".mp3", true)) &&
+                                !name.contains("_spectrogram")) {
+                                fileName = name
+                                break
+                            }
+                        }
+
+                        if (fileName == null) return@async null
+
+                        val encoded = fileName.split("/").joinToString("/") {
+                            URLEncoder.encode(it, "UTF-8").replace("+", "%20")
+                        }
+
+                        Track(
+                            id = id,
+                            title = d.optString("title", "Без названия"),
+                            artist = d.optString("creator", artist),
+                            license = d.optString("licenseurl"),
+                            stream = "https://archive.org/download/$id/$encoded"
+                        )
+                    } catch (_: Exception) {
+                        null
+                    } finally {
+                        semaphore.release()
+                    }
+                }
+            }.awaitAll()
+                .filterNotNull()
+                .distinctBy { it.id }
+                .take(100)
+
         } catch (_: Exception) {
             emptyList()
         }
     }
-
 @Composable
 fun NoctraApp(
     player: ExoPlayer,
